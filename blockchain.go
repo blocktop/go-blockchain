@@ -130,7 +130,7 @@ func (b *Blockchain) mainLoop() {
 			for i, bl := range branch {
 				hd[i] = bl.GetID()[:6]
 			}
-			glog.Infof("Peer %s: %s generating block %d for branch %v", b.peerID[:6], b.GetType(), head.GetBlockNumber() + 1, hd)
+			glog.Infof("Peer %s: %s generating block %d for branch %v", b.peerID[:6], b.GetType(), head.GetBlockNumber()+1, hd)
 			b.conesensus.SetCompeted(head)
 			newBlock = b.blockGenerator.GenerateBlock(branch)
 		}
@@ -178,14 +178,14 @@ func (b *Blockchain) receiveBlock(block spec.Block) {
 
 	if !block.Validate() {
 		glog.Infof("Peer %s: %s received invalid block %s", b.peerID[:6], b.GetType(), blockID[:6])
-		return 
+		return
 	}
 	if b.conesensus.AddBlock(block) {
 		glog.Infof("Peer %s: %s added block %s", b.peerID[:6], b.GetType(), blockID[:6])
 	} else {
 		glog.Infof("Peer %s: %s disqualified block %s", b.peerID[:6], b.GetType(), blockID[:6])
 	}
-	
+
 	b.removeAwaiting(blockID)
 	return
 }
@@ -238,6 +238,6 @@ func (b *Blockchain) confirmBlock(block spec.Block) {
 	b.Unlock()
 
 	if !isLocal && b.onBlockConfirmed != nil {
-		go b.onBlockConfirmed(block)	
+		go b.onBlockConfirmed(block)
 	}
 }

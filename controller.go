@@ -1,32 +1,27 @@
 package blockchain
 
 import (
-	"time"
-
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 
 	spec "github.com/blckit/go-spec"
-	"github.com/golang/protobuf/proto"
-	"github.com/google/uuid"
 )
 
 type Controller struct {
 	Blockchains         map[string]spec.Blockchain
 	TransactionHandlers map[string]spec.TransactionHandler
-	Network             spec.Network
+	NetworkNode         spec.NetworkNode
 	PeerID              string
 }
 
-const MessageHeaderVersion = "v1"
-
-func NewController(network spec.Network, peerID string) *Controller {
-	c := &Controller{Network: network, PeerID: peerID}
+func NewController(networkNode spec.NetworkNode) *Controller {
+	c := &Controller{NetworkNode: networkNode, PeerID: networkNode.GetPeerID()}
 
 	c.Blockchains = make(map[string]spec.Blockchain)
 	c.TransactionHandlers = make(map[string]spec.TransactionHandler)
-	c.Network.OnMessageReceived(func(message proto.Message, p *spec.MessageProtocol) {
-		c.reseceiveMessage(message, p)
+	c.NetworkNode.OnMessageReceived(func(message proto.Message, p *spec.MessageProtocol) {
+		c.receiveMessage(message, p)
 	})
 
 	return c
@@ -113,7 +108,7 @@ func (c *Controller) executeTransactions(bcType string, block spec.Block) {
 func (c *Controller) confirmLocalBlock(bcType string, block spec.Block) {
 	// hooray!
 	// TODO: Log our success and our reward
-	glog.Warningf("Peer %s: %s local block confirmed, reward = %d", c.PeerID[:6], bcType, 1000000000	)
+	glog.Warningf("Peer %s: %s local block confirmed, reward = %d", c.PeerID[:6], bcType, 1000000000)
 }
 
 func (c *Controller) broadcastBlock(bcType string, block spec.Block) {
@@ -123,28 +118,17 @@ func (c *Controller) broadcastBlock(bcType string, block spec.Block) {
 	p.SetComponentType(block.GetType())
 	p.SetVersion(block.GetVersion())
 
-	id := block.GetID()
-	uri := spec.NewURIFromProtocol(p, id)
-
-	header := &MessageHeader{
-		Version:   MessageHeaderVersion,
-		ID:        uuid.New().String(),
-		Timestamp: time.Now().UnixNano() / int64(time.Millisecond),
-		From:      c.PeerID,
-		URI:       uri.String()}
-
 	message := block.Marshal()
 	a, err := ptypes.MarshalAny(message)
 	if err != nil {
 		//TODO
 		return
 	}
-	header.Message = a
 
-	c.Network.Broadcast(header, p)
+	c.NetworkNode.Broadcast(a, p)
 }
 
-func (c *Controller) reseceiveMessage(message proto.Message, p *spec.MessageProtocol) {
+func (c *Controller) receiveMessage(message proto.Message, p *spec.MessageProtocol) {
 	bcType := p.GetBlockchainType()
 	if !p.IsValid() {
 		// something not right, what to do?
@@ -156,23 +140,13 @@ func (c *Controller) reseceiveMessage(message proto.Message, p *spec.MessageProt
 		return
 	}
 
-	header := message.(*MessageHeader)
-	if !c.verifyHeader(header) {
-		//TODO
-		return
-	}
-
 	switch p.GetResourceType() {
 	case "transaction":
-		go c.receiveTransaction(bc, header.GetMessage(), p)
+		go c.receiveTransaction(bc, message, p)
 
 	case "block":
-		go c.receiveBlock(bc, header.GetMessage())
+		go c.receiveBlock(bc, message)
 	}
-}
-
-func (c *Controller) verifyHeader(header *MessageHeader) bool {
-	return true
 }
 
 func (c *Controller) receiveTransaction(bc spec.Blockchain, message proto.Message, p *spec.MessageProtocol) {
