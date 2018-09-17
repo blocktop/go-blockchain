@@ -1,51 +1,58 @@
 package blockchain
 
 import (
+	"context"
+	"fmt"
+	"os"
 	"sync"
-	"time"
 
 	spec "github.com/blckit/go-spec"
 	"github.com/golang/glog"
+	"github.com/spf13/viper"
 )
 
 type Blockchain struct {
 	sync.Mutex
-	Type                  string
-	blockGenerator        spec.BlockGenerator
-	conesensus            spec.Consensus
-	onBlockGenerated      spec.BlockGeneratedHandler
-	onBlockConfirmed      spec.BlockConfirmedHandler
-	onLocalBlockConfirmed spec.BlockConfirmedHandler
-	BlockInterval         int64 //milliseconds
-	started               bool
-	localBlocks           []spec.Block
-	awaiting              []string
-	genesis               bool
-	peerID                string
+	blockchainType string
+	receive        chan *spec.BroadcastBlock
+	broadcast      chan *spec.BroadcastBlock
+	confirm        chan spec.Block
+	confirmLocal   chan spec.Block
+	blockGenerator spec.BlockGenerator
+	conesensus     spec.Consensus
+	started        bool
+	localBlocks    []spec.Block
+	awaiting       []string
+	genesis        bool
+	peerID         string
+	logPeerID      string
+	stopProc       []chan bool
 }
 
-const DefaultBlockInterval = int64(3 * time.Second / time.Millisecond)
-
-func NewBlockchain(bcType string, blockGenerator spec.BlockGenerator, consensus spec.Consensus, peerID string) *Blockchain {
+func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus, peerID string) *Blockchain {
 	b := &Blockchain{}
 
-	b.Type = bcType
-	b.BlockInterval = DefaultBlockInterval
+	b.blockchainType = viper.GetString("blockchain.type")
 	b.blockGenerator = blockGenerator
 	b.conesensus = consensus
 	b.localBlocks = make([]spec.Block, 0)
+	b.broadcast = make(chan *spec.BroadcastBlock, 25)
+	b.receive = make(chan *spec.BroadcastBlock, 100)
+	b.confirm = make(chan spec.Block, 25)
+	b.confirmLocal = make(chan spec.Block, 10)
+
 	b.peerID = peerID
-	consensus.OnBlockConfirmed(func(block spec.Block) {
-		b.confirmBlock(block)
-	})
+	if peerID[:2] == "Qm" {
+		b.logPeerID = peerID[2:8] // remove the "Qm" and take 6 runes
+	} else {
+		b.logPeerID = peerID[:6]
+	}
+
 	return b
 }
 
 func (b *Blockchain) GetType() string {
-	if b.Type != "" {
-		return b.Type
-	}
-	return "blckit"
+	return b.blockchainType
 }
 
 func (b *Blockchain) ProduceGenesisBlock() {
@@ -60,15 +67,38 @@ func (b *Blockchain) GetConsensus() spec.Consensus {
 	return b.conesensus
 }
 
-func (b *Blockchain) Start() {
+func (b *Blockchain) GetBroadcastChan() <-chan *spec.BroadcastBlock {
+	return b.broadcast
+}
+
+func (b *Blockchain) GetReceiveChan() chan<- *spec.BroadcastBlock {
+	return b.receive
+}
+
+func (b *Blockchain) GetConfirmChan() <-chan spec.Block {
+	return b.confirm
+}
+
+func (b *Blockchain) GetConfirmLocalChan() <-chan spec.Block {
+	return b.confirmLocal
+}
+
+func (b *Blockchain) Start(ctx context.Context) {
 	if b.started {
 		return
 	}
 	b.started = true
 
-	glog.Infof("Starting blockchain %s", b.GetType())
+	fmt.Fprintf(os.Stderr, "Peer %s: Starting %s\n", b.logPeerID, b.GetType())
 
-	go b.mainLoop()
+	b.stopProc = make([]chan bool, 3)
+	for i := 0; i < 3; i++ {
+		b.stopProc[i] = make(chan bool)
+	}
+
+	go b.generateBlocks(ctx)
+	go b.receiveBlocks(ctx)
+	go b.confirmBlocks(ctx)
 }
 
 func (b *Blockchain) Stop() {
@@ -76,122 +106,138 @@ func (b *Blockchain) Stop() {
 		return
 	}
 
-	glog.Infof("Stopping blockchain %s", b.GetType())
+	fmt.Fprintf(os.Stderr, "\nPeer %s: Stopping %s", b.logPeerID, b.GetType())
 
 	b.started = false
+
+	for i := 0; i < 3; i++ {
+		b.stopProc[i] <- true
+	}
 }
 
 func (b *Blockchain) IsRunning() bool {
 	return b.started
 }
 
-// RecieveBlock receives a block from the network and adds it to the
-// consensus system.
-func (b *Blockchain) ReceiveBlock(block spec.Block) {
-	if !b.conesensus.WasSeen(block) {
-		go b.receiveBlock(block)
+func (b *Blockchain) generateBlocks(ctx context.Context) {
+	if viper.GetBool("blockchain.genesis") {
+		b.generateGenesis()
 	}
-}
 
-func (b *Blockchain) OnBlockGenerated(f spec.BlockGeneratedHandler) {
-	b.onBlockGenerated = f
-}
+	compete := b.conesensus.GetCompetitionChan()
 
-func (b *Blockchain) OnBlockConfirmed(f spec.BlockConfirmedHandler) {
-	b.onBlockConfirmed = f
-}
-
-func (b *Blockchain) OnLocalBlockConfirmed(f spec.BlockConfirmedHandler) {
-	b.onLocalBlockConfirmed = f
-}
-
-func (b *Blockchain) mainLoop() {
-	for b.started {
-		time.Sleep(200 * time.Millisecond)
-		var newBlock spec.Block
-		if b.genesis {
-			b.genesis = false
-			newBlock = b.blockGenerator.ProduceGenesisBlock()
-		} else {
-			branch := b.conesensus.GetBestBranch()
-			if branch == nil || len(branch) == 0 {
-				glog.Infof("Peer %s: %s has no heads", b.peerID[:6], b.GetType())
-				continue
-			}
-
-			head := branch[0]
-			nowMilli := time.Now().UnixNano() / int64(time.Millisecond)
-			latestTime := nowMilli - b.BlockInterval
-			headTime := head.GetTimestamp()
-			if headTime > latestTime {
-				continue
-			}
-			hd := make([]string, len(branch))
-			for i, bl := range branch {
-				hd[i] = bl.GetID()[:6]
-			}
-			glog.Infof("Peer %s: %s generating block %d for branch %v", b.peerID[:6], b.GetType(), head.GetBlockNumber()+1, hd)
-			b.conesensus.SetCompeted(head)
-			newBlock = b.blockGenerator.GenerateBlock(branch)
-		}
-
-		if newBlock == nil {
-			continue
-		}
-
-		if !newBlock.Validate() {
-			glog.Infof("Peer %s: %s generated invalid block:\n %v", b.peerID[:6], b.GetType(), newBlock)
-			continue
-		}
-
-		if !b.conesensus.AddBlock(newBlock) {
-			glog.Infof("Peer %s: %s disqualified local block %s", b.peerID[:6], b.GetType(), newBlock.GetID()[:6])
-			continue
-		}
-
-		b.Lock()
-		b.localBlocks = append(b.localBlocks, newBlock)
-		b.Unlock()
-
-		if b.onBlockGenerated != nil {
-			go b.onBlockGenerated(newBlock)
+	for {
+		select {
+		case <-b.stopProc[2]:
+		case <-ctx.Done():
+			return
+		case branch := <-compete:
+			b.generateBlock(branch)
 		}
 	}
 }
 
-func (b *Blockchain) receiveBlock(block spec.Block) {
-	// check - lock - check pattern
-	blockID := block.GetID()
-	if b.isAwaiting(blockID) {
-		b.logAwaiting(blockID)
+func (b *Blockchain) generateGenesis() {
+	glog.Warningf("Peer %s: %s generating geneisis block", b.logPeerID, b.GetType())
+	newBlock := b.blockGenerator.ProduceGenesisBlock()
+	b.processNewBlock(newBlock)
+}
+
+func (b *Blockchain) generateBlock(branch []spec.Block) {
+	hd := make([]string, len(branch))
+	for i, bl := range branch {
+		hd[i] = bl.GetID()[:6]
+	}
+	head := branch[0]
+	glog.Warningf("Peer %s: %s generating block %d for branch %v", b.logPeerID, b.GetType(), head.GetBlockNumber()+1, hd)
+	b.conesensus.SetCompeted(head)
+	newBlock := b.blockGenerator.GenerateBlock(branch)
+
+	b.processNewBlock(newBlock)
+
+}
+
+func (b *Blockchain) processNewBlock(newBlock spec.Block) {
+	if newBlock == nil {
 		return
+	}
+
+	if !newBlock.Validate() {
+		glog.V(1).Infof("Peer %s: %s generated invalid block:\n %v", b.logPeerID, b.GetType(), newBlock)
+		return
+	}
+
+	if !b.conesensus.AddBlock(newBlock, true) {
+		glog.V(1).Infof("Peer %s: %s disqualified local block %s", b.logPeerID, b.GetType(), newBlock.GetID()[:6])
+		return
+	}
+
+	b.Lock()
+	b.localBlocks = append(b.localBlocks, newBlock)
+	b.Unlock()
+
+	glog.V(1).Infof("Peer %s: %s generated block %d: %s", b.logPeerID, b.GetType(), newBlock.GetBlockNumber(), newBlock.GetID()[:6])
+
+	broadcast := &spec.BroadcastBlock{
+		Block: newBlock,
+		From:  b.peerID}
+
+	b.broadcast <- broadcast
+}
+
+func (b *Blockchain) receiveBlocks(ctx context.Context) {
+	for {
+		select {
+		case <-b.stopProc[0]:
+		case <-ctx.Done():
+			return
+		case broadcast := <-b.receive:
+			b.receiveBlock(broadcast)
+		}
+	}
+}
+
+func (b *Blockchain) receiveBlock(broadcast *spec.BroadcastBlock) {
+	block := broadcast.Block
+
+	if b.conesensus.WasSeen(block) {
+		return
+	}
+
+	blockID := block.GetID()
+	if !b.setAwaiting(blockID) {
+		return
+	}
+
+	if !block.Validate() {
+		glog.V(1).Infof("Peer %s: %s received invalid block %s", b.logPeerID, b.GetType(), blockID[:6])
+		return
+	}
+
+	if b.conesensus.AddBlock(block, false) {
+		glog.V(1).Infof("Peer %s: %s added block %s", b.logPeerID, b.GetType(), blockID[:6])
+		b.broadcast <- broadcast
+	} else {
+		glog.V(1).Infof("Peer %s: %s disqualified block %s", b.logPeerID, b.GetType(), blockID[:6])
+	}
+
+	b.removeAwaiting(blockID)
+}
+
+func (b *Blockchain) setAwaiting(blockID string) bool {
+	// check - lock - check pattern
+	if b.isAwaiting(blockID) {
+		return false
 	}
 
 	b.Lock()
 	if b.isAwaiting(blockID) {
 		b.Unlock()
-		b.logAwaiting(blockID)
-		return
+		return false
 	}
 	b.awaiting = append(b.awaiting, blockID)
 	b.Unlock()
-
-	if !block.Validate() {
-		glog.Infof("Peer %s: %s received invalid block %s", b.peerID[:6], b.GetType(), blockID[:6])
-		return
-	}
-	if b.conesensus.AddBlock(block) {
-		glog.Infof("Peer %s: %s added block %s", b.peerID[:6], b.GetType(), blockID[:6])
-	} else {
-		glog.Infof("Peer %s: %s disqualified block %s", b.peerID[:6], b.GetType(), blockID[:6])
-	}
-
-	b.removeAwaiting(blockID)
-	return
-}
-
-func (b *Blockchain) logAwaiting(blockID string) {
-	glog.Infof("Peer %s: %s already awaiting block %s", b.peerID[:6], b.GetType(), blockID[:6])
+	return true
 }
 
 func (b *Blockchain) isAwaiting(blockID string) bool {
@@ -213,6 +259,20 @@ func (b *Blockchain) removeAwaiting(blockID string) {
 	b.Unlock()
 }
 
+func (b *Blockchain) confirmBlocks(ctx context.Context) {
+	ch := b.conesensus.GetConfirmChan()
+	for {
+		//time.Sleep(100 * time.Millisecond)
+		select {
+		case <-b.stopProc[1]:
+		case <-ctx.Done():
+			return
+		case block := <-ch:
+			b.confirmBlock(block)
+		}
+	}
+}
+
 func (b *Blockchain) confirmBlock(block spec.Block) {
 	// is it a locally generated block?
 	// also remove any blocks that are as old or older than the confirmed block
@@ -226,9 +286,7 @@ func (b *Blockchain) confirmBlock(block spec.Block) {
 		localBlock := b.localBlocks[i]
 		if localBlock.GetID() == blockID {
 			isLocal = true
-			if b.onLocalBlockConfirmed != nil {
-				go b.onLocalBlockConfirmed(block)
-			}
+			b.confirmLocal <- block
 		}
 		if localBlock.GetBlockNumber() > blockNumber {
 			newLocalBlocks = append(newLocalBlocks, localBlock)
@@ -237,7 +295,7 @@ func (b *Blockchain) confirmBlock(block spec.Block) {
 	b.localBlocks = newLocalBlocks
 	b.Unlock()
 
-	if !isLocal && b.onBlockConfirmed != nil {
-		go b.onBlockConfirmed(block)
+	if !isLocal {
+		b.confirm <- block
 	}
 }
