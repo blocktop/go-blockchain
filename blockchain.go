@@ -22,7 +22,7 @@ import (
 	"os"
 	"sync"
 
-	spec "github.com/blckit/go-spec"
+	spec "github.com/blocktop/go-spec"
 	"github.com/golang/glog"
 	"github.com/spf13/viper"
 )
