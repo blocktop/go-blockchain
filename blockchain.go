@@ -30,8 +30,7 @@ import (
 type Blockchain struct {
 	sync.Mutex
 	blockchainType string
-	receive        chan *spec.BroadcastBlock
-	broadcast      chan *spec.BroadcastBlock
+	broadcast      chan<- *spec.NetworkMessage
 	blockGenerator spec.BlockGenerator
 	consensus      spec.Consensus
 	started        bool
@@ -40,6 +39,9 @@ type Blockchain struct {
 	logPeerID      string
 	stopProc1      chan bool
 	stopProc2      chan bool
+	confirm				 chan spec.Block
+	confirmLocal   chan spec.Block
+	compete        chan []spec.Block
 }
 
 func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus, peerID string) *Blockchain {
@@ -48,8 +50,9 @@ func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus,
 	b.blockchainType = viper.GetString("blockchain.type")
 	b.blockGenerator = blockGenerator
 	b.consensus = consensus
-	b.broadcast = make(chan *spec.BroadcastBlock, 25)
-	b.receive = make(chan *spec.BroadcastBlock, 100)
+	b.confirm = make(chan spec.Block, 25)
+	b.confirmLocal = make(chan spec.Block, 10)
+	b.compete = make(chan []spec.Block, 1)
 
 	b.peerID = peerID
 	if peerID[:2] == "Qm" {
@@ -73,15 +76,7 @@ func (b *Blockchain) GetConsensus() spec.Consensus {
 	return b.consensus
 }
 
-func (b *Blockchain) GetBroadcastChan() <-chan *spec.BroadcastBlock {
-	return b.broadcast
-}
-
-func (b *Blockchain) GetReceiveChan() chan<- *spec.BroadcastBlock {
-	return b.receive
-}
-
-func (b *Blockchain) Start(ctx context.Context) {
+func (b *Blockchain) Start(ctx context.Context, broadcastChan chan<- *spec.NetworkMessage) {
 	if b.started {
 		return
 	}
@@ -91,10 +86,11 @@ func (b *Blockchain) Start(ctx context.Context) {
 
 	b.stopProc1 = make(chan bool, 1)
 	b.stopProc2 = make(chan bool, 1)
+	b.broadcast = broadcastChan
 
-	b.consensus.Start(ctx)
+	b.consensus.Start(ctx, b.confirm, b.confirmLocal, b.compete)
 	go b.generateBlocks(ctx)
-	go b.receiveBlocks(ctx)
+	go b.confirmBlocks(ctx)
 }
 
 func (b *Blockchain) Stop() {
@@ -114,19 +110,51 @@ func (b *Blockchain) IsRunning() bool {
 	return b.started
 }
 
+func (b *Blockchain) ReceiveBlock(netMsg *spec.NetworkMessage) {
+	msg := netMsg.Message
+	block := b.blockGenerator.Unmarshal(msg)
+
+	if b.consensus.WasSeen(block) {
+		return
+	}
+
+	blockID := block.GetID()
+	if !b.setAwaiting(blockID) {
+		return
+	}
+
+	glog.V(1).Infof("Peer %s: %s received block %s", b.logPeerID, b.blockchainType, block.GetID()[:6])
+
+	if !block.Validate() {
+		glog.V(1).Infof("Peer %s: %s received invalid block %s", b.logPeerID, b.GetType(), blockID[:6])
+		return
+	}
+
+	if b.consensus.AddBlock(block, false) {
+		glog.V(1).Infof("Peer %s: %s added block %s", b.logPeerID, b.GetType(), blockID[:6])
+		b.broadcast <- netMsg
+	} else {
+		glog.V(1).Infof("Peer %s: %s disqualified block %s", b.logPeerID, b.GetType(), blockID[:6])
+	}
+
+	b.removeAwaiting(blockID)
+}
+
+func (b *Blockchain) ReceiveTransaction(netMsg *spec.NetworkMessage) {
+	b.blockGenerator.ReceiveTransaction(netMsg)
+}
+
 func (b *Blockchain) generateBlocks(ctx context.Context) {
 	if viper.GetBool("blockchain.genesis") {
 		b.generateGenesis()
 	}
-
-	compete := b.consensus.GetCompetitionChan()
 
 	for {
 		select {
 		case <-b.stopProc1:
 		case <-ctx.Done():
 			return
-		case branch := <-compete:
+		case branch := <-b.compete:
 			b.generateBlock(branch)
 		}
 	}
@@ -169,50 +197,33 @@ func (b *Blockchain) processNewBlock(newBlock spec.Block) {
 
 	glog.V(1).Infof("Peer %s: %s generated block %d: %s", b.logPeerID, b.GetType(), newBlock.GetBlockNumber(), newBlock.GetID()[:6])
 
-	broadcast := &spec.BroadcastBlock{
-		Block: newBlock,
-		From:  b.peerID}
+	p := &spec.MessageProtocol{}
+	p.SetBlockchainType(b.blockchainType)
+	p.SetResourceType(spec.ResourceTypeBlock)
+	p.SetComponentType(newBlock.GetType())
+	p.SetVersion(newBlock.GetVersion())
 
-	b.broadcast <- broadcast
+	netMsg := &spec.NetworkMessage{
+		Message: newBlock.Marshal(),
+		From: b.peerID,
+		Protocol: p}
+
+	b.broadcast <- netMsg
 }
 
-func (b *Blockchain) receiveBlocks(ctx context.Context) {
+func (b *Blockchain) confirmBlocks(ctx context.Context) {
 	for {
 		select {
 		case <-b.stopProc2:
 		case <-ctx.Done():
 			return
-		case broadcast := <-b.receive:
-			b.receiveBlock(broadcast)
+		case block := <-b.confirm:
+			b.blockGenerator.CommitBlock(block) 
+		case block := <-b.confirmLocal:
+			b.blockGenerator.CommitBlock(block)
+			glog.Warningf("Peer %s: %s local block %s confirmed, reward = %d", b.logPeerID, b.blockchainType, block.GetID()[:6], 1000000000)
 		}
 	}
-}
-
-func (b *Blockchain) receiveBlock(broadcast *spec.BroadcastBlock) {
-	block := broadcast.Block
-
-	if b.consensus.WasSeen(block) {
-		return
-	}
-
-	blockID := block.GetID()
-	if !b.setAwaiting(blockID) {
-		return
-	}
-
-	if !block.Validate() {
-		glog.V(1).Infof("Peer %s: %s received invalid block %s", b.logPeerID, b.GetType(), blockID[:6])
-		return
-	}
-
-	if b.consensus.AddBlock(block, false) {
-		glog.V(1).Infof("Peer %s: %s added block %s", b.logPeerID, b.GetType(), blockID[:6])
-		b.broadcast <- broadcast
-	} else {
-		glog.V(1).Infof("Peer %s: %s disqualified block %s", b.logPeerID, b.GetType(), blockID[:6])
-	}
-
-	b.removeAwaiting(blockID)
 }
 
 func (b *Blockchain) setAwaiting(blockID string) bool {
