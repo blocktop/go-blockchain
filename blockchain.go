@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	push "github.com/blocktop/go-push-components"
 	spec "github.com/blocktop/go-spec"
@@ -31,18 +32,19 @@ import (
 
 type Blockchain struct {
 	sync.Mutex
-	blockchainType string
-	broadcast      spec.NetworkBroadcaster
-	blockGenerator spec.BlockGenerator
-	consensus      spec.Consensus
-	started        bool
-	awaiting       *sync.Map
-	peerID         string
-	logPeerID      string
-	confirmQ       *push.PushQueue
-	confirmLocalQ  *push.PushQueue
-	competeQ       *push.PushQueue
-	confirmBlockNumber uint64
+	blockchainType      string
+	broadcast           spec.NetworkBroadcaster
+	blockGenerator      spec.BlockGenerator
+	consensus           spec.Consensus
+	started             bool
+	awaiting            *sync.Map
+	peerID              string
+	logPeerID           string
+	confirmQ            *push.PushQueue
+	confirmLocalQ       *push.PushQueue
+	generateBlockNumber uint64
+	confirmBlockNumber  uint64
+	intervalStop        chan bool
 }
 
 var bold *color.Color = color.New(color.Bold)
@@ -54,6 +56,7 @@ func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus,
 	b.blockGenerator = blockGenerator
 	b.consensus = consensus
 	b.awaiting = &sync.Map{}
+	b.intervalStop = make(chan bool, 1)
 
 	b.confirmQ = push.NewPushQueue(1, 100, func(item push.QueueItem) {
 		if block, ok := b.castToBlock(item); ok {
@@ -73,18 +76,8 @@ func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus,
 		glog.Errorln(color.HiRedString("Peer %s: confirm local queue was overloaded", b.logPeerID))
 	})
 
-	b.competeQ = push.NewPushQueue(1, 1, func(item push.QueueItem) {
-		if branch, ok := item.([]spec.Block); ok {
-			b.generateBlock(branch)
-		} else {
-			glog.Warningf("Peer %s: received wroing item type in branch compete queue", b.logPeerID)
-		}
-	})
-	b.competeQ.DropOldestOnOverload()
-
 	b.confirmQ.Start()
 	b.confirmLocalQ.Start()
-	b.competeQ.Start()
 
 	b.peerID = peerID
 	if peerID[:2] == "Qm" {
@@ -132,12 +125,37 @@ func (b *Blockchain) Start(ctx context.Context, broadcastFn spec.NetworkBroadcas
 	b.consensus.OnLocalBlockConfirmed(func(block spec.Block) {
 		b.confirmLocalQ.Put(block)
 	})
-	b.consensus.OnCompete(func(branch []spec.Block) {
-		b.competeQ.Put(branch)
-	})
+
+	go b.runBlockInterval(ctx)
 
 	if viper.GetBool("blockchain.genesis") {
 		go b.generateGenesis()
+	}
+}
+
+func (b *Blockchain) runBlockInterval(ctx context.Context) {
+	ticker := time.NewTicker(viper.GetDuration("blockchain.blockInterval"))
+	for {
+		select {
+		case <-ctx.Done():
+		case <-b.intervalStop:
+			return
+		case <-ticker.C:
+			// Since blocks are arriving much more frequently than this
+			// single node is producing them, we expect that there will
+			// always be some branch ready to compete on. However, we
+			// check just in case there is not.
+			branch, switchHeads := b.consensus.Competition().Branch(b.generateBlockNumber)
+			// TODO: if switchHeads find latest block generated on the new head, if any.
+			// Generate on that.
+			_ = switchHeads
+			if branch != nil {
+				b.generateBlockNumber = branch[0].BlockNumber() + 1
+				go b.generateBlock(branch)
+			} else {
+				glog.V(2).Infof("Peer %s: %s had no competition at block %d", b.logPeerID, b.blockchainType, b.generateBlockNumber)
+			}
+		}
 	}
 }
 
@@ -176,19 +194,19 @@ func (b *Blockchain) ReceiveBlock(netMsg *spec.NetworkMessage) error {
 	if _, loaded := b.awaiting.LoadOrStore(blockID, true); loaded {
 		return nil
 	}
-	
-	glog.V(1).Infof("Peer %s: %s received block %s", b.logPeerID, b.blockchainType, blockID[:6])
+
+	glog.V(1).Infof("Peer %s: %s received block %d:%s", b.logPeerID, b.blockchainType, block.BlockNumber(), blockID[:6])
 
 	if !block.Validate() {
-		glog.V(1).Infof("Peer %s: %s received invalid block %s", b.logPeerID, b.Type(), blockID[:6])
+		glog.V(1).Infof("Peer %s: %s received invalid block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), blockID[:6])
 		return nil
 	}
 
 	if b.consensus.AddBlock(block, false) {
-		glog.V(1).Infof("Peer %s: %s added block %s", b.logPeerID, b.Type(), blockID[:6])
+		glog.V(1).Infof("Peer %s: %s added and broadcasting block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), blockID[:6])
 		b.broadcast(netMsg)
 	} else {
-		glog.V(1).Infof("Peer %s: %s disqualified block %s", b.logPeerID, b.Type(), blockID[:6])
+		glog.V(1).Infof("Peer %s: %s disqualified block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), blockID[:6])
 	}
 
 	b.awaiting.Delete(blockID)
@@ -207,6 +225,7 @@ func (b *Blockchain) generateGenesis() {
 	glog.Warningf("Peer %s: %s generating genesis block", b.logPeerID, b.Type())
 	newBlock := b.blockGenerator.GenerateGenesisBlock()
 	b.processNewBlock(newBlock)
+	b.generateBlockNumber++
 }
 
 func (b *Blockchain) generateBlock(branch []spec.Block) {
@@ -243,7 +262,7 @@ func (b *Blockchain) processNewBlock(newBlock spec.Block) {
 		return
 	}
 
-	glog.V(1).Infof("Peer %s: %s generated block %d: %s", b.logPeerID, b.Type(), newBlock.BlockNumber(), newBlock.Hash()[:6])
+	glog.V(1).Infof("Peer %s: %s generated block %d:%s", b.logPeerID, b.Type(), newBlock.BlockNumber(), newBlock.Hash()[:6])
 
 	p := &spec.MessageProtocol{}
 	p.SetBlockchainType(b.blockchainType)
@@ -259,7 +278,7 @@ func (b *Blockchain) processNewBlock(newBlock spec.Block) {
 	netMsg := &spec.NetworkMessage{
 		Data:     data,
 		Links:    links,
-		Hash:			newBlock.Hash(),
+		Hash:     newBlock.Hash(),
 		From:     b.peerID,
 		Protocol: p}
 
@@ -267,8 +286,8 @@ func (b *Blockchain) processNewBlock(newBlock spec.Block) {
 }
 
 func (b *Blockchain) confirmBlock(block spec.Block, local bool) {
-	if b.confirmBlockNumber > 0 && block.BlockNumber() != b.confirmBlockNumber + 1 {
-		panic("confirming out of order")
+	if b.confirmBlockNumber > 0 && block.BlockNumber() != b.confirmBlockNumber+1 {
+		panic(fmt.Sprintf("blocked attempt to confirm out of order: block %d", block.BlockNumber()))
 	}
 	b.confirmBlockNumber = block.BlockNumber()
 	b.blockGenerator.CommitBlock(block)
@@ -278,4 +297,3 @@ func (b *Blockchain) confirmBlock(block spec.Block, local bool) {
 		glog.Warningf("Peer %s: %s block %d confirmed %s", b.logPeerID, b.blockchainType, block.BlockNumber(), bold.Sprint(block.Hash()[:6]))
 	}
 }
-
