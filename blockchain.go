@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
+
+	"github.com/blocktop/go-kernel"
 
 	push "github.com/blocktop/go-push-components"
 	spec "github.com/blocktop/go-spec"
@@ -32,104 +33,94 @@ import (
 
 type Blockchain struct {
 	sync.Mutex
-	blockchainType      string
-	broadcast           spec.NetworkBroadcaster
-	blockGenerator      spec.BlockGenerator
-	consensus           spec.Consensus
-	started             bool
-	awaiting            *sync.Map
-	peerID              string
-	logPeerID           string
-	confirmQ            *push.PushQueue
-	confirmLocalQ       *push.PushQueue
-	receiveBlockQ       *push.PushQueue
-	generateBlockNumber uint64
-	confirmBlockNumber  uint64
-	intervalStop        chan bool
-	interval            *blockInterval
+	name               string
+	blockGenerator     spec.BlockGenerator
+	consensus          spec.Consensus
+	started            bool
+	awaiting           *sync.Map
+	prID               string
+	confirmQ           *push.PushQueue
+	confirmLocalQ      *push.PushQueue
+	confirmBlockNumber uint64
+	intervalStop       chan bool
 }
+
+// Compile-time check for interface compliance
+var _ spec.Blockchain = (*Blockchain)(nil)
 
 var bold *color.Color = color.New(color.Bold)
 
-func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus, peerID string) *Blockchain {
+func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus) *Blockchain {
 	b := &Blockchain{}
 
-	b.blockchainType = viper.GetString("blockchain.type")
+	b.name = viper.GetString("blockchain.name")
 	b.blockGenerator = blockGenerator
 	b.consensus = consensus
 	b.awaiting = &sync.Map{}
 	b.intervalStop = make(chan bool, 1)
-	b.interval = newBlockInterval()
 
-	b.confirmQ = push.NewPushQueue(1, 100, func(item push.QueueItem) {
+	b.confirmQ = push.NewPushQueue(1, 100, func(item interface{}) {
 		if block, ok := b.castToBlock(item); ok {
 			b.confirmBlock(block, false)
 		}
 	})
-	b.confirmQ.OnFirstOverload(func(item push.QueueItem) {
-		glog.Errorln(color.HiRedString("Peer %s: confirm queue was overloaded", b.logPeerID))
+	b.confirmQ.OnFirstOverload(func(item interface{}) {
+		glog.Errorln(color.HiRedString("Peer %s: confirm queue was overloaded", b.logPeerID()))
 	})
 
-	b.confirmLocalQ = push.NewPushQueue(1, 100, func(item push.QueueItem) {
+	b.confirmLocalQ = push.NewPushQueue(1, 100, func(item interface{}) {
 		if block, ok := b.castToBlock(item); ok {
 			b.confirmBlock(block, true)
 		}
 	})
-	b.confirmLocalQ.OnFirstOverload(func(item push.QueueItem) {
-		glog.Errorln(color.HiRedString("Peer %s: confirm local queue was overloaded", b.logPeerID))
+	b.confirmLocalQ.OnFirstOverload(func(item interface{}) {
+		glog.Errorln(color.HiRedString("Peer %s: confirm local queue was overloaded", b.logPeerID()))
 	})
-
-	b.receiveBlockQ = push.NewPushQueue(1, 1000, func(item push.QueueItem) {
-		data := item.([]interface{})
-		block := data[0].(spec.Block)
-		netMsg := data[1].(*spec.NetworkMessage)
-
-		b.receiveBlockWorker(block, netMsg)
-	})
-	// TODO: some kind of overload protection.
 
 	b.confirmQ.Start()
 	b.confirmLocalQ.Start()
 
-	b.peerID = peerID
-	if peerID[:2] == "Qm" {
-		b.logPeerID = peerID[2:8] // remove the "Qm" and take 6 runes
-	} else {
-		b.logPeerID = peerID[:6]
-	}
-
 	return b
 }
 
-func (b *Blockchain) castToBlock(item push.QueueItem) (spec.Block, bool) {
+func (b *Blockchain) peerID() string {
+	if b.prID == "" {
+		b.prID = kernel.Network().PeerID()
+	}
+	return b.prID
+}
+
+func (b *Blockchain) logPeerID() string {
+	prID := b.peerID()
+	if prID[:2] == "Qm" {
+		return prID[2:8] // remove the "Qm" and take 6 runes
+	}
+	return prID[:6]
+}
+
+func (b *Blockchain) castToBlock(item interface{}) (spec.Block, bool) {
 	block, ok := item.(spec.Block)
 	if !ok {
-		glog.Warningf("Peer %s: received wrong item type in block confirm queue", b.logPeerID)
+		glog.Warningf("Peer %s: received wrong item type in block confirm queue", b.logPeerID())
 	}
 	return block, ok
 }
 
-func (b *Blockchain) Type() string {
-	return b.blockchainType
-}
-
-func (b *Blockchain) BlockGenerator() spec.BlockGenerator {
-	return b.blockGenerator
+func (b *Blockchain) Name() string {
+	return b.name
 }
 
 func (b *Blockchain) Consensus() spec.Consensus {
 	return b.consensus
 }
 
-func (b *Blockchain) Start(ctx context.Context, broadcastFn spec.NetworkBroadcaster) {
+func (b *Blockchain) Start(ctx context.Context) {
 	if b.started {
 		return
 	}
 	b.started = true
 
-	fmt.Fprintf(os.Stderr, "Peer %s: Starting %s\n", b.logPeerID, b.Type())
-
-	b.broadcast = broadcastFn
+	fmt.Fprintf(os.Stderr, "Peer %s: Starting %s\n", b.logPeerID(), b.Name())
 
 	b.consensus.OnBlockConfirmed(func(block spec.Block) {
 		b.confirmQ.Put(block)
@@ -137,91 +128,6 @@ func (b *Blockchain) Start(ctx context.Context, broadcastFn spec.NetworkBroadcas
 	b.consensus.OnLocalBlockConfirmed(func(block spec.Block) {
 		b.confirmLocalQ.Put(block)
 	})
-
-	go b.runBlockInterval(ctx)
-
-	if viper.GetBool("blockchain.genesis") {
-		go b.generateGenesis()
-	}
-}
-
-// 1. Evaluate heads
-// 2a. Generate block   2b. StartComms
-// 											3b. Receive blocks
-// 4. Stop comms when block generate done
-// 6. Confirm blocks
-
-const (
-	stateEval = iota
-	stateGen
-	stateConf
-)
-
-func (b *Blockchain) runBlockInterval(ctx context.Context) {
-	state := stateEval
-	var comp spec.Competition
-
-	for {
-		select {
-		case <-ctx.Done():
-		case <-b.intervalStop:
-			return
-		default:
-			switch state {
-			case stateEval:
-				startTime := time.Now().UnixNano()
-				comp = b.consensus.Competition()
-				endTime := time.Now().UnixNano()
-				b.interval.addEvalHeadTime(endTime - startTime)
-				state = stateGen
-
-			case stateGen:
-
-				// Start receiving blocks
-				b.receiveBlockQ.Start()
-
-				// Start a timer for the portion of the block interval calculated
-				// for network time.
-				t := time.NewTimer(b.interval.getNetworkTime())
-
-				// Get the branch we are to generate on.
-				branch, rootID, switchHeads := comp.Branch(b.generateBlockNumber)
-				// TODO: if switchHeads find latest block generated on the new head, if any.
-				// Generate on that.
-				_ = switchHeads
-				var newBlock spec.Block
-				if branch != nil {
-					b.generateBlockNumber = branch[0].BlockNumber() + 1
-					newBlock = b.generateBlock(branch, rootID)
-				} else {
-					glog.V(2).Infof("Peer %s: %s had no competition at block %d", b.logPeerID, b.blockchainType, b.generateBlockNumber)
-				}
-
-				// Wait for the block to generate and the timer to expire, which ever comes last.
-				<-t.C
-
-				// Stop receiving blocks.
-				b.receiveBlockQ.Stop()
-
-				// Add the new block to consensus.
-				if newBlock != nil {
-					startTime := time.Now().UnixNano()
-					b.processNewBlock(newBlock)
-					endTime := time.Now().UnixNano()
-					b.interval.addAddBlockTime(endTime - startTime)
-				}
-
-				state = stateConf
-
-			case stateConf:
-				startTime := time.Now().UnixNano()
-				b.consensus.ConfirmBlocks()
-				endTime := time.Now().UnixNano()
-				b.interval.addConfBlockTime(endTime - startTime)
-				state = stateEval
-			}
-		}
-	}
 }
 
 func (b *Blockchain) Stop() {
@@ -229,7 +135,7 @@ func (b *Blockchain) Stop() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\nPeer %s: Stopping %s", b.logPeerID, b.Type())
+	fmt.Fprintf(os.Stderr, "\nPeer %s: Stopping %s", b.logPeerID(), b.Name())
 
 	//TODO block until queues are drained
 	b.started = false
@@ -239,48 +145,54 @@ func (b *Blockchain) IsRunning() bool {
 	return b.started
 }
 
-func (b *Blockchain) ReceiveBlock(netMsg *spec.NetworkMessage) error {
-	block, err := b.blockGenerator.ReceiveBlock(netMsg)
-	if err != nil {
-		return err
+func (b *Blockchain) AddBlocks(blocks []spec.Block, local bool) (spec.Block, error) {
+	validBlocks := make([]spec.Block, 0)
+
+	for _, block := range blocks {
+		blockID := block.Hash()
+
+		if blockID == "" {
+			glog.Warningln(color.HiYellowString("ignoring bad block received"))
+			continue
+		}
+
+		if b.consensus.WasSeen(block) {
+			continue
+		}
+
+		if _, loaded := b.awaiting.LoadOrStore(blockID, true); loaded {
+			continue
+		}
+
+		glog.V(1).Infof("Peer %s: %s received block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), blockID[:6])
+
+		if !block.Valid() {
+			glog.V(1).Infof("Peer %s: %s received invalid block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), blockID[:6])
+			continue
+		}
+
+		validBlocks = append(validBlocks, block)
 	}
 
-	blockID := block.Hash()
-
-	if blockID == "" {
-		glog.Errorln(color.HiRedString("Peer %s: bad block received from %s", netMsg.From[2:6]))
-		return nil
+	if len(validBlocks) > 0 {
+		addedBlock, disqualifiedBlocks, err := b.consensus.AddBlocks(validBlocks, local)
+		if err != nil {
+			return nil, err
+		}
+		if disqualifiedBlocks != nil {
+			for _, block := range disqualifiedBlocks {
+				glog.V(1).Infof("Peer %s: %s disqualified block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), block.Hash()[:6])
+				b.awaiting.Delete(block.Hash())
+			}
+		}
+		if addedBlock != nil {
+			glog.V(1).Infof("Peer %s: %s added and broadcasting block %d:%s", b.logPeerID(), b.Name(), addedBlock.BlockNumber(), addedBlock.Hash()[:6])
+			b.awaiting.Delete(addedBlock.Hash())
+		}
+		return addedBlock, nil
 	}
 
-	if b.consensus.WasSeen(block) {
-		return nil
-	}
-
-	if _, loaded := b.awaiting.LoadOrStore(blockID, true); loaded {
-		return nil
-	}
-
-	glog.V(1).Infof("Peer %s: %s received block %d:%s", b.logPeerID, b.blockchainType, block.BlockNumber(), blockID[:6])
-
-	if !block.Validate() {
-		glog.V(1).Infof("Peer %s: %s received invalid block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), blockID[:6])
-		return nil
-	}
-
-	b.receiveBlockQ.Put([]interface{}{block, netMsg})
-
-	return nil
-}
-
-func (b *Blockchain) receiveBlockWorker(block spec.Block, netMsg *spec.NetworkMessage) {
-	if b.consensus.AddBlock(block, false) {
-		glog.V(1).Infof("Peer %s: %s added and broadcasting block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), block.Hash()[:6])
-		b.broadcast(netMsg)
-	} else {
-		glog.V(1).Infof("Peer %s: %s disqualified block %d:%s", b.logPeerID, b.Type(), block.BlockNumber(), block.Hash()[:6])
-	}
-
-	b.awaiting.Delete(block.Hash())
+	return nil, nil
 }
 
 func (b *Blockchain) ReceiveTransaction(netMsg *spec.NetworkMessage) error {
@@ -291,14 +203,13 @@ func (b *Blockchain) ReceiveTransaction(netMsg *spec.NetworkMessage) error {
 	return nil
 }
 
-func (b *Blockchain) generateGenesis() {
-	glog.Warningf("Peer %s: %s generating genesis block", b.logPeerID, b.Type())
+func (b *Blockchain) GenerateGenesis() spec.Block {
+	glog.Warningf("Peer %s: %s generating genesis block", b.logPeerID(), b.Name())
 	newBlock := b.blockGenerator.GenerateGenesisBlock()
-	b.processNewBlock(newBlock)
-	b.generateBlockNumber = 0
+	return newBlock
 }
 
-func (b *Blockchain) generateBlock(branch []spec.Block, rootID int) spec.Block {
+func (b *Blockchain) GenerateBlock(branch []spec.Block, rootID int) spec.Block {
 	branchLog := "[ "
 	for i, bl := range branch {
 		if i > 3 {
@@ -312,49 +223,14 @@ func (b *Blockchain) generateBlock(branch []spec.Block, rootID int) spec.Block {
 	}
 	branchLog += fmt.Sprintf("... %d ]", rootID)
 	head := branch[0]
-	glog.Warningf("Peer %s: %s generating block %d for branch %s", b.logPeerID, b.Type(), head.BlockNumber()+1, branchLog)
+	glog.Warningf("Peer %s: %s generating block %d for branch %s", b.logPeerID(), b.Name(), head.BlockNumber()+1, branchLog)
 	b.consensus.SetCompeted(head)
 	newBlock := b.blockGenerator.GenerateBlock(branch)
 
 	if newBlock == nil {
 		return nil
 	}
-
-	if !newBlock.Validate() {
-		glog.V(1).Infof("Peer %s: %s generated invalid block:\n %v", b.logPeerID, b.Type(), newBlock)
-		return nil
-	}
-
 	return newBlock
-}
-
-func (b *Blockchain) processNewBlock(newBlock spec.Block) {
-	if !b.consensus.AddBlock(newBlock, true) {
-		glog.V(1).Infof("Peer %s: %s disqualified local block %d:%s", b.logPeerID, b.Type(), newBlock.BlockNumber(), newBlock.Hash()[:6])
-		return
-	}
-
-	glog.V(1).Infof("Peer %s: %s generated block %d:%s", b.logPeerID, b.Type(), newBlock.BlockNumber(), newBlock.Hash()[:6])
-
-	p := &spec.MessageProtocol{}
-	p.SetBlockchainType(b.blockchainType)
-	p.SetResourceType(spec.ResourceTypeBlock)
-	p.SetComponentType(newBlock.Name())
-	p.SetVersion(newBlock.Version())
-
-	data, links, err := newBlock.Marshal()
-	if err != nil {
-		glog.Errorln(color.HiRedString("Peer %s: generated bad block %s", b.logPeerID, newBlock.Hash()))
-		return
-	}
-	netMsg := &spec.NetworkMessage{
-		Data:     data,
-		Links:    links,
-		Hash:     newBlock.Hash(),
-		From:     b.peerID,
-		Protocol: p}
-
-	go b.broadcast(netMsg)
 }
 
 func (b *Blockchain) confirmBlock(block spec.Block, local bool) {
@@ -364,8 +240,8 @@ func (b *Blockchain) confirmBlock(block spec.Block, local bool) {
 	b.confirmBlockNumber = block.BlockNumber()
 	b.blockGenerator.CommitBlock(block)
 	if local {
-		glog.Warningf("Peer %s: %s local block %d confirmed %s", b.logPeerID, b.blockchainType, block.BlockNumber(), color.HiGreenString(bold.Sprint(block.Hash()[:6])))
+		glog.Warningf("Peer %s: %s local block %d confirmed %s", b.logPeerID(), b.Name(), block.BlockNumber(), color.HiGreenString(bold.Sprint(block.Hash()[:6])))
 	} else {
-		glog.Warningf("Peer %s: %s block %d confirmed %s", b.logPeerID, b.blockchainType, block.BlockNumber(), bold.Sprint(block.Hash()[:6]))
+		glog.Warningf("Peer %s: %s block %d confirmed %s", b.logPeerID(), b.Name(), block.BlockNumber(), bold.Sprint(block.Hash()[:6]))
 	}
 }
