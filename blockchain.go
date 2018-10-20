@@ -65,7 +65,7 @@ func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus)
 		}
 	})
 	b.confirmQ.OnFirstOverload(func(item interface{}) {
-		glog.Errorln(color.HiRedString("Peer %s: confirm queue was overloaded", b.logPeerID()))
+		glog.Errorln(color.HiRedString("Confirm queue was overloaded"))
 	})
 
 	b.confirmLocalQ = push.NewPushQueue(1, 100, func(item interface{}) {
@@ -74,7 +74,7 @@ func NewBlockchain(blockGenerator spec.BlockGenerator, consensus spec.Consensus)
 		}
 	})
 	b.confirmLocalQ.OnFirstOverload(func(item interface{}) {
-		glog.Errorln(color.HiRedString("Peer %s: confirm local queue was overloaded", b.logPeerID()))
+		glog.Errorln(color.HiRedString("Confirm local queue was overloaded"))
 	})
 
 	b.confirmQ.Start()
@@ -101,7 +101,7 @@ func (b *Blockchain) logPeerID() string {
 func (b *Blockchain) castToBlock(item interface{}) (spec.Block, bool) {
 	block, ok := item.(spec.Block)
 	if !ok {
-		glog.Warningf("Peer %s: received wrong item type in block confirm queue", b.logPeerID())
+		glog.Warningln("Received wrong item type in block confirm queue")
 	}
 	return block, ok
 }
@@ -120,7 +120,7 @@ func (b *Blockchain) Start(ctx context.Context) {
 	}
 	b.started = true
 
-	fmt.Fprintf(os.Stderr, "Peer %s: Starting %s\n", b.logPeerID(), b.Name())
+	fmt.Fprintf(os.Stderr, "Starting %s\n", b.Name())
 
 	b.consensus.OnBlockConfirmed(func(block spec.Block) {
 		b.confirmQ.Put(block)
@@ -135,7 +135,7 @@ func (b *Blockchain) Stop() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\nPeer %s: Stopping %s", b.logPeerID(), b.Name())
+	fmt.Fprintf(os.Stderr, "\nStopping %s", b.Name())
 
 	//TODO block until queues are drained
 	b.started = false
@@ -145,7 +145,7 @@ func (b *Blockchain) IsRunning() bool {
 	return b.started
 }
 
-func (b *Blockchain) AddBlocks(blocks []spec.Block, local bool) (spec.Block, error) {
+func (b *Blockchain) AddBlocks(blocks []spec.Block, local bool) *spec.AddBlocksResponse {
 	validBlocks := make([]spec.Block, 0)
 
 	for _, block := range blocks {
@@ -164,10 +164,10 @@ func (b *Blockchain) AddBlocks(blocks []spec.Block, local bool) (spec.Block, err
 			continue
 		}
 
-		glog.V(1).Infof("Peer %s: %s received block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), blockID[:6])
+		glog.V(1).Infof("%s received block %d:%s", b.Name(), block.BlockNumber(), blockID[:6])
 
 		if !block.Valid() {
-			glog.V(1).Infof("Peer %s: %s received invalid block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), blockID[:6])
+			glog.V(1).Infof("%s received invalid block %d:%s", b.Name(), block.BlockNumber(), blockID[:6])
 			continue
 		}
 
@@ -175,24 +175,24 @@ func (b *Blockchain) AddBlocks(blocks []spec.Block, local bool) (spec.Block, err
 	}
 
 	if len(validBlocks) > 0 {
-		addedBlock, disqualifiedBlocks, err := b.consensus.AddBlocks(validBlocks, local)
-		if err != nil {
-			return nil, err
+		res := b.consensus.AddBlocks(validBlocks, local)
+		if res.Error != nil {
+			return res
 		}
-		if disqualifiedBlocks != nil {
-			for _, block := range disqualifiedBlocks {
-				glog.V(1).Infof("Peer %s: %s disqualified block %d:%s", b.logPeerID(), b.Name(), block.BlockNumber(), block.Hash()[:6])
+		if res.DisqualifiedBlocks != nil {
+			for _, block := range res.DisqualifiedBlocks {
+				glog.V(1).Infof("%s disqualified block %d:%s", b.Name(), block.BlockNumber(), block.Hash()[:6])
 				b.awaiting.Delete(block.Hash())
 			}
 		}
-		if addedBlock != nil {
-			glog.V(1).Infof("Peer %s: %s added and broadcasting block %d:%s", b.logPeerID(), b.Name(), addedBlock.BlockNumber(), addedBlock.Hash()[:6])
-			b.awaiting.Delete(addedBlock.Hash())
+		if res.AddedBlock != nil {
+			glog.V(1).Infof("%s added and broadcasting block %d:%s", b.Name(), res.AddedBlock.BlockNumber(), res.AddedBlock.Hash()[:6])
+			b.awaiting.Delete(res.AddedBlock.Hash())
 		}
-		return addedBlock, nil
+		return res
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (b *Blockchain) ReceiveTransaction(netMsg *spec.NetworkMessage) error {
@@ -204,7 +204,7 @@ func (b *Blockchain) ReceiveTransaction(netMsg *spec.NetworkMessage) error {
 }
 
 func (b *Blockchain) GenerateGenesis() spec.Block {
-	glog.Warningf("Peer %s: %s generating genesis block", b.logPeerID(), b.Name())
+	glog.Warningf("%s generating genesis block", b.Name())
 	newBlock := b.blockGenerator.GenerateGenesisBlock()
 	return newBlock
 }
@@ -223,7 +223,7 @@ func (b *Blockchain) GenerateBlock(branch []spec.Block, rootID int) spec.Block {
 	}
 	branchLog += fmt.Sprintf("... %d ]", rootID)
 	head := branch[0]
-	glog.Warningf("Peer %s: %s generating block %d for branch %s", b.logPeerID(), b.Name(), head.BlockNumber()+1, branchLog)
+	glog.Warningf("%s generating block %d for branch %s", b.Name(), head.BlockNumber()+1, branchLog)
 	b.consensus.SetCompeted(head)
 	newBlock := b.blockGenerator.GenerateBlock(branch)
 
@@ -240,8 +240,8 @@ func (b *Blockchain) confirmBlock(block spec.Block, local bool) {
 	b.confirmBlockNumber = block.BlockNumber()
 	b.blockGenerator.CommitBlock(block)
 	if local {
-		glog.Warningf("Peer %s: %s local block %d confirmed %s", b.logPeerID(), b.Name(), block.BlockNumber(), color.HiGreenString(bold.Sprint(block.Hash()[:6])))
+		glog.Warningf("%s local block %d confirmed %s", b.Name(), block.BlockNumber(), color.HiGreenString(bold.Sprint(block.Hash()[:6])))
 	} else {
-		glog.Warningf("Peer %s: %s block %d confirmed %s", b.logPeerID(), b.Name(), block.BlockNumber(), bold.Sprint(block.Hash()[:6]))
+		glog.Warningf("%s block %d confirmed %s", b.Name(), block.BlockNumber(), bold.Sprint(block.Hash()[:6]))
 	}
 }
